@@ -2076,6 +2076,9 @@ class DICOMViewer(QMainWindow):
                 skipped_results += 1
         self._refresh_results_list()
 
+        if hasattr(self, "rc_tab") and hasattr(self.rc_tab, "clear_all_workflow_state"):
+            self.rc_tab.clear_all_workflow_state()
+
         self._restore_lesion_workflow_ui_state(data.get("ui_state") or {})
         self._update_ui_state()
         self._update_lesion_ui_state()

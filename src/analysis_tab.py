@@ -119,6 +119,7 @@ class DataAnalysisTab(QWidget):
         self._noise_roi_radius_vox = 5.0
         self._noise_roi_radius_mm = 14.0
         self._noise_roi_template_key = None
+        self._last_analysis_output_dir = None
         self._metric_labels = {
             "__none__": "None",
             "__sample_index__": "Sample Index",
@@ -933,6 +934,26 @@ class DataAnalysisTab(QWidget):
         )
         self.plot_current_results()
 
+    def _analysis_output_dir(self):
+        base = getattr(self, "_last_analysis_output_dir", None)
+        if base and os.path.isdir(base):
+            return base
+        return None
+
+    def _dialog_path(self, filename):
+        """Start file dialogs in the last folder used on Tab 4."""
+        base = self._analysis_output_dir()
+        if base:
+            return os.path.join(base, filename)
+        return filename
+
+    def _remember_dialog_path(self, path):
+        if not path:
+            return
+        remembered = path if os.path.isdir(path) else os.path.dirname(path)
+        if remembered and os.path.isdir(remembered):
+            self._last_analysis_output_dir = remembered
+
     def clear_all_workflow_state(self):
         """Reset Tab 4 to the same baseline as after a first initial reconstruction."""
         self._scenario_data = {}
@@ -945,6 +966,8 @@ class DataAnalysisTab(QWidget):
         self._noise_roi_radius_vox = 5.0
         self._noise_roi_radius_mm = 14.0
         self._noise_roi_template_key = None
+        self._cached_lesion_exclusion_mask = None
+        self._cached_global_bg_mask = None
         self._invalidate_analysis_results()
         self.refresh_sources()
         self.plot_current_results()
@@ -1035,11 +1058,12 @@ class DataAnalysisTab(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Import scenario image(s)",
-            "",
+            self._analysis_output_dir() or "",
             "Supported images (*.npy *.nii *.nii.gz *.mha *.mhd *.nrrd);;NumPy array (*.npy);;NIfTI (*.nii *.nii.gz);;MetaImage (*.mha *.mhd);;NRRD (*.nrrd)",
         )
         if not paths:
             return
+        self._remember_dialog_path(paths[0])
         imported = 0
         errors = []
         for path in paths:
@@ -1078,9 +1102,12 @@ class DataAnalysisTab(QWidget):
         if self.results_table.columnCount() == 0 or self.results_table.rowCount() == 0:
             QMessageBox.information(self, "No data", "Run an analysis first.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Export results to CSV", "analysis_results.csv", "CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export results to CSV", self._dialog_path("analysis_results.csv"), "CSV (*.csv)"
+        )
         if not path:
             return
+        self._remember_dialog_path(path)
         try:
             headers = [self.results_table.horizontalHeaderItem(c).text() for c in range(self.results_table.columnCount())]
             lines = [",".join([h.replace(',', ' ') for h in headers])]
@@ -1301,11 +1328,12 @@ class DataAnalysisTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save analysis session",
-            "analysis_session.json",
+            self._dialog_path("analysis_session.json"),
             "JSON session (*.json);;All files (*.*)",
         )
         if not path:
             return
+        self._remember_dialog_path(path)
         if not path.lower().endswith(".json"):
             path += ".json"
         x_key = self.x_axis_combo.currentData()
@@ -1381,11 +1409,12 @@ class DataAnalysisTab(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load analysis session",
-            "",
+            self._analysis_output_dir() or "",
             "JSON session (*.json);;All files (*.*)",
         )
         if not path:
             return
+        self._remember_dialog_path(path)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1580,9 +1609,14 @@ class DataAnalysisTab(QWidget):
             QMessageBox.warning(self, "No Scenario", "Select at least one scenario to export.")
             return
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder for NIfTI export")
+        out_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select output folder for NIfTI export",
+            self._analysis_output_dir() or "",
+        )
         if not out_dir:
             return
+        self._remember_dialog_path(out_dir)
 
         spacing = self._voxel_spacing()  # x, y, z in mm
         exported = 0
@@ -1887,8 +1921,11 @@ class DataAnalysisTab(QWidget):
             margin = max(margin, 10.0, 2.0 * fwhm)
         return float(margin)
 
-    def _all_lesion_exclusion_mask(self, shape, lesions=None):
+    def _all_lesion_exclusion_mask(self, shape, lesions=None, use_cache=True):
         """Union of lesion masks plus a physical spill margin (mm) excluded from global noise ROI."""
+        cached = getattr(self, "_cached_lesion_exclusion_mask", None)
+        if use_cache and cached is not None and cached.shape == shape:
+            return cached
         if lesions is None:
             lesions = self._selected_lesions()
         if not lesions:
@@ -1988,10 +2025,55 @@ class DataAnalysisTab(QWidget):
             }
         return cache
 
-    def _background_ring_mask(self, lesion, shape):
-        lesion_mask = self._lesion_mask(lesion, shape)
+    def _background_ring_mask_from_mask(self, lesion_mask):
         dilated = scipy.ndimage.binary_dilation(lesion_mask, iterations=3)
         return np.logical_and(dilated, np.logical_not(lesion_mask))
+
+    def _background_ring_mask(self, lesion, shape):
+        return self._background_ring_mask_from_mask(self._lesion_mask(lesion, shape))
+
+    def _build_lesion_run_cache(self, shape, lesions, mode):
+        """
+        Lesion-only quantities shared across all scenarios in one Run Analysis pass.
+        Avoids rebuilding masks, truth volumes, and Gibbs distance transforms per row.
+        """
+        need_rc = mode in ("Recovery Coefficients", "Noise-Bias Curve", "Post-Recon Filtering Effect")
+        need_bg = mode in ("Noise-Bias Curve", "Post-Recon Filtering Effect")
+        need_gibbs = mode == "Gibbs Effect"
+        need_radiomics = mode == "Radiomics"
+        need_volume = mode in ("Recovery Coefficients", "Noise-Bias Curve", "Gibbs Effect", "Radiomics")
+        need_truth = need_rc or need_gibbs or need_radiomics
+        use_per_lesion_ring = need_bg and not self._use_global_liver_noise_roi()
+
+        spacing = None
+        if need_gibbs:
+            spacing = np.array(self._voxel_spacing(), dtype=np.float64)
+            spacing = np.where(spacing > 0, spacing, 1.0)
+
+        cache = {}
+        for lesion_idx, lesion in lesions:
+            mask = self._lesion_mask(lesion, shape)
+            entry = {"mask": mask}
+            if need_volume:
+                entry["volume_ml"] = self._lesion_volume_ml(lesion, shape)
+            if use_per_lesion_ring:
+                entry["bg_ring_mask"] = self._background_ring_mask_from_mask(mask)
+            if need_truth:
+                truth = self._synthetic_phantom_lesion_volume(lesion, shape)
+                reference_voxels = self._reference_lesion_voxels(
+                    lesion, shape, mask, truth=truth
+                )
+                entry["reference_voxels"] = reference_voxels
+                if need_rc or need_gibbs:
+                    entry["expected_mean"] = float(
+                        self._expected_lesion_mean(lesion, shape, mask, truth=truth)
+                    )
+                if need_radiomics and reference_voxels.size > 0:
+                    entry["reference_radiomics"] = self._radiomics(reference_voxels)
+            if need_gibbs:
+                entry["signed_distance_mm"] = self._lesion_signed_distance(mask, spacing)
+            cache[lesion_idx] = entry
+        return cache
 
     def _use_global_liver_noise_roi(self):
         if self.analysis_mode_combo.currentText() != "Noise-Bias Curve":
@@ -2003,6 +2085,9 @@ class DataAnalysisTab(QWidget):
 
     def _global_liver_noise_mask(self, shape, lesions=None):
         """Filled sphere in physical mm, excluding all lesions and a spill margin."""
+        cached = getattr(self, "_cached_global_bg_mask", None)
+        if cached is not None and cached.shape == shape:
+            return cached
         sphere = self._noise_roi_sphere_mask(shape, self._noise_roi_spacing_mm())
         if sphere is None or not np.any(sphere):
             return sphere
@@ -2030,14 +2115,16 @@ class DataAnalysisTab(QWidget):
         """
         return build_lesion_truth_on_grid(shape, lesion)
 
-    def _reference_lesion_voxels(self, lesion, image, lesion_mask):
+    def _reference_lesion_voxels(self, lesion, shape, lesion_mask, truth=None):
         """Reference intensities from the Tab 3 lesion definition (mask + intensity model)."""
-        truth = self._synthetic_phantom_lesion_volume(lesion, image.shape)
+        if truth is None:
+            truth = self._synthetic_phantom_lesion_volume(lesion, shape)
         return reference_lesion_voxels_on_grid(truth, lesion_mask)
 
-    def _expected_lesion_mean(self, lesion, shape, lesion_mask):
+    def _expected_lesion_mean(self, lesion, shape, lesion_mask, truth=None):
         """Mean inserted truth from the Tab 3 lesion definition."""
-        truth = self._synthetic_phantom_lesion_volume(lesion, shape)
+        if truth is None:
+            truth = self._synthetic_phantom_lesion_volume(lesion, shape)
         return expected_lesion_mean_on_grid(truth, lesion_mask, lesion)
 
     def _radiomics(self, voxels):
@@ -2172,6 +2259,7 @@ class DataAnalysisTab(QWidget):
         background_voxels,
         lesion,
         reference_voxels,
+        signed_d=None,
     ):
         """
         Test 2 (Gibbs Effect) — three literature-validated edge-artifact metrics:
@@ -2254,7 +2342,8 @@ class DataAnalysisTab(QWidget):
             result["overshoot_percent"] = 100.0 * (lesion_peak / L_safe - 1.0)
             return result
 
-        signed_d = self._lesion_signed_distance(mask_bool, spacing)
+        if signed_d is None:
+            signed_d = self._lesion_signed_distance(mask_bool, spacing)
         a_plus, a_minus, b_bg = self._gibbs_shell_voxels(image, signed_d, psf_fwhm, bin_mm)
 
         peak_for_overshoot = lesion_peak
@@ -2281,45 +2370,40 @@ class DataAnalysisTab(QWidget):
         return out.astype(np.float32)
 
     def _compute_record(
-        self, scenario_name, image, lesion_idx, lesion, fwhm_mm=0.0, scenario_noise_cache=None, lesions=None
+        self,
+        scenario_name,
+        image,
+        lesion_idx,
+        lesion,
+        fwhm_mm=0.0,
+        scenario_noise_cache=None,
+        lesions=None,
+        analysis_mode=None,
+        lesion_run_cache=None,
     ):
-        lesion_mask = self._lesion_mask(lesion, image.shape)
-        bg_mask = self._noise_background_mask(lesion, image.shape, lesions=lesions)
-        lesion_vox = image[lesion_mask]
-        reference_voxels = self._reference_lesion_voxels(lesion, image, lesion_mask)
+        mode = analysis_mode or self.analysis_mode_combo.currentText()
+        need_rc = mode in ("Recovery Coefficients", "Noise-Bias Curve", "Post-Recon Filtering Effect")
+        need_bg = mode in ("Noise-Bias Curve", "Post-Recon Filtering Effect")
+        need_gibbs = mode == "Gibbs Effect"
+        need_radiomics = mode == "Radiomics"
+        need_means = need_rc or need_gibbs
+        need_volume = mode in ("Recovery Coefficients", "Noise-Bias Curve", "Gibbs Effect", "Radiomics")
+        need_abs_bias = mode == "Noise-Bias Curve"
+        need_cnr = mode == "Post-Recon Filtering Effect"
+        store_expected_mean = mode in ("Recovery Coefficients", "Noise-Bias Curve", "Gibbs Effect")
 
-        measured_mean = float(np.mean(lesion_vox)) if lesion_vox.size > 0 else 0.0
-        expected_mean = float(self._expected_lesion_mean(lesion, image.shape, lesion_mask))
-        rc = measured_mean / expected_mean if abs(expected_mean) > 1e-9 else 0.0
-        bias = 100.0 * (rc - 1.0)
-        abs_bias = abs(bias)
-        noise_roi_voxel_count = 0
-        noise_roi_min_lesion_distance_mm = float("nan")
-        noise_spill_exclusion_mm = float("nan")
-        if scenario_noise_cache and scenario_name in scenario_noise_cache:
-            cached = scenario_noise_cache[scenario_name]
-            noise_cv = float(cached.get("noise_cv_percent", float("nan")))
-            bg_mean = float(cached.get("noise_bg_mean", 0.0))
-            bg_std = float(cached.get("noise_bg_std", 0.0))
-            noise_roi_voxel_count = int(cached.get("noise_roi_voxel_count", 0))
-            noise_roi_min_lesion_distance_mm = float(
-                cached.get("noise_roi_min_lesion_distance_mm", float("nan"))
-            )
-            noise_spill_exclusion_mm = float(cached.get("noise_spill_exclusion_mm", float("nan")))
-            bg_vox = image[bg_mask] if bg_mask is not None and np.any(bg_mask) else np.array([], dtype=np.float32)
+        scenario_meta = self._scenario_meta.get(
+            scenario_name, {"modality": "Unknown", "algo": "Unknown", "iter_number": 0}
+        )
+        lesion_entry = (lesion_run_cache or {}).get(lesion_idx)
+        if lesion_entry is not None:
+            lesion_mask = lesion_entry["mask"]
+            volume_ml = lesion_entry.get("volume_ml")
         else:
-            noise_cv, bg_mean, bg_std, noise_roi_voxel_count = self._noise_cv_from_background_voxels(
-                image, bg_mask
-            )
-            bg_vox = image[bg_mask] if bg_mask is not None and np.any(bg_mask) else np.array([], dtype=np.float32)
-        noise_ref_name = ""
-        if self._use_global_liver_noise_roi() and self._noise_roi_center_mm is not None:
-            mx, my, mz = self._noise_roi_center_mm
-            noise_ref_name = (
-                f"roi@({mx:.1f},{my:.1f},{mz:.1f})mm r={self._noise_roi_radius_mm:.1f}mm"
-            )
-        cnr = (measured_mean - bg_mean) / (bg_std + 1e-9)
-        scenario_meta = self._scenario_meta.get(scenario_name, {"modality": "Unknown", "algo": "Unknown", "iter_number": 0})
+            lesion_mask = self._lesion_mask(lesion, image.shape)
+            volume_ml = self._lesion_volume_ml(lesion, image.shape) if need_volume else None
+        lesion_vox = image[lesion_mask]
+        measured_mean = float(np.mean(lesion_vox)) if lesion_vox.size > 0 else 0.0
 
         rec = {
             "scenario": scenario_name,
@@ -2328,47 +2412,96 @@ class DataAnalysisTab(QWidget):
             "iter_number": scenario_meta.get("iter_number", -1),
             "lesion_idx": lesion_idx + 1,
             "lesion_name": getattr(lesion, "name", f"Lesion_{lesion_idx+1}"),
-            # Patient-derived library lesions carry a non-None custom_shape; uniform
-            # spheres do not. The flag is exposed in records so downstream code
-            # (table, plot, summary) can distinguish lesion kinds; DSI itself
-            # gates per-feature on the well-definedness of the ground truth,
-            # not on the lesion kind, so SUV-class stability is available even
-            # for spheres while entropy-class features auto-skip when degenerate.
             "is_library": bool(getattr(lesion, "custom_shape", None) is not None),
             "lesion_kind": "library" if getattr(lesion, "custom_shape", None) is not None else "sphere",
-            "volume_ml": self._lesion_volume_ml(lesion, image.shape),
             "lesion_radius_px": float(getattr(lesion, "radius", 0.0)),
-            "expected_mean": expected_mean,
-            "measured_mean": measured_mean,
-            "rc_mean": rc,
-            "cnr": cnr,
-            "bias_percent": bias,
-            "abs_bias_percent": abs_bias,
-            "noise_cv_percent": noise_cv,
-            "noise_bg_mean": bg_mean,
-            "noise_bg_std": bg_std,
-            "noise_roi_voxel_count": noise_roi_voxel_count,
-            "noise_roi_min_lesion_distance_mm": noise_roi_min_lesion_distance_mm,
-            "noise_spill_exclusion_mm": noise_spill_exclusion_mm,
-            "noise_reference_mode": (
-                "global_liver" if self._use_global_liver_noise_roi() else "per_lesion_ring"
-            ),
-            "noise_reference_lesion": noise_ref_name,
-            "noise_voxel_source_scenario": scenario_name,
             "filter_fwhm_mm": float(fwhm_mm),
         }
+        if need_volume and volume_ml is not None:
+            rec["volume_ml"] = volume_ml
+
+        reference_voxels = None
+        reference_radiomics = None
+        if need_rc or need_gibbs or need_radiomics:
+            if lesion_entry is not None and "reference_voxels" in lesion_entry:
+                reference_voxels = lesion_entry["reference_voxels"]
+            else:
+                reference_voxels = self._reference_lesion_voxels(lesion, image.shape, lesion_mask)
+
+        if need_means or need_radiomics:
+            rec["measured_mean"] = measured_mean
+
+        if need_rc or need_gibbs:
+            if lesion_entry is not None and "expected_mean" in lesion_entry:
+                expected_mean = float(lesion_entry["expected_mean"])
+            else:
+                expected_mean = float(self._expected_lesion_mean(lesion, image.shape, lesion_mask))
+            if store_expected_mean or need_gibbs:
+                rec["expected_mean"] = expected_mean
+
+        if need_rc:
+            rc = measured_mean / expected_mean if abs(expected_mean) > 1e-9 else 0.0
+            bias = 100.0 * (rc - 1.0)
+            rec["rc_mean"] = rc
+            rec["bias_percent"] = bias
+            if need_abs_bias:
+                rec["abs_bias_percent"] = abs(bias)
+
+        if need_bg:
+            if lesion_entry is not None and "bg_ring_mask" in lesion_entry:
+                bg_mask = lesion_entry["bg_ring_mask"]
+            else:
+                bg_mask = self._noise_background_mask(lesion, image.shape, lesions=lesions)
+            if scenario_noise_cache and scenario_name in scenario_noise_cache:
+                cached = scenario_noise_cache[scenario_name]
+                noise_cv = float(cached.get("noise_cv_percent", float("nan")))
+                bg_mean = float(cached.get("noise_bg_mean", 0.0))
+                bg_std = float(cached.get("noise_bg_std", 0.0))
+                noise_roi_voxel_count = int(cached.get("noise_roi_voxel_count", 0))
+                noise_roi_min_lesion_distance_mm = float(
+                    cached.get("noise_roi_min_lesion_distance_mm", float("nan"))
+                )
+                noise_spill_exclusion_mm = float(cached.get("noise_spill_exclusion_mm", float("nan")))
+            else:
+                noise_cv, bg_mean, bg_std, noise_roi_voxel_count = self._noise_cv_from_background_voxels(
+                    image, bg_mask
+                )
+                noise_roi_min_lesion_distance_mm = float("nan")
+                noise_spill_exclusion_mm = float("nan")
+            rec["noise_cv_percent"] = noise_cv
+            if need_cnr:
+                rec["cnr"] = (measured_mean - bg_mean) / (bg_std + 1e-9)
+            if mode == "Noise-Bias Curve":
+                rec["noise_bg_mean"] = bg_mean
+                rec["noise_roi_voxel_count"] = noise_roi_voxel_count
+                rec["noise_roi_min_lesion_distance_mm"] = noise_roi_min_lesion_distance_mm
+                rec["noise_spill_exclusion_mm"] = noise_spill_exclusion_mm
+                rec["noise_reference_mode"] = (
+                    "global_liver" if self._use_global_liver_noise_roi() else "per_lesion_ring"
+                )
+                rec["noise_voxel_source_scenario"] = scenario_name
+
+        if need_gibbs:
+            signed_d = None
+            if lesion_entry is not None:
+                signed_d = lesion_entry.get("signed_distance_mm")
+            rec.update(
+                self._gibbs_metrics(
+                    image,
+                    lesion_mask,
+                    lesion_vox,
+                    np.array([], dtype=np.float32),
+                    lesion,
+                    reference_voxels,
+                    signed_d=signed_d,
+                )
+            )
+
+        if not need_radiomics:
+            return rec
+
         lesion_radiomics = self._radiomics(lesion_vox)
         rec.update(lesion_radiomics)
-        rec.update(
-            self._gibbs_metrics(
-                image,
-                lesion_mask,
-                lesion_vox,
-                bg_vox,
-                lesion,
-                reference_voxels,
-            )
-        )
 
         # Reference radiomics: ground truth from the Tab 3 lesion definition (mask + intensity model).
         # Per-feature stability is the absolute relative deviation from ground truth, matching the
@@ -2381,7 +2514,10 @@ class DataAnalysisTab(QWidget):
             {"std", "cv_percent", "entropy", "energy", "skewness", "kurtosis"}
         )
         if reference_voxels.size > 0:
-            reference_radiomics = self._radiomics(reference_voxels)
+            if lesion_entry is not None and "reference_radiomics" in lesion_entry:
+                reference_radiomics = lesion_entry["reference_radiomics"]
+            else:
+                reference_radiomics = self._radiomics(reference_voxels)
             for key, base_val in reference_radiomics.items():
                 rec[f"ground_truth_{key}"] = base_val
                 cur_val = lesion_radiomics.get(key, 0.0)
@@ -2393,21 +2529,16 @@ class DataAnalysisTab(QWidget):
                     ref_std = float(np.std(reference_voxels.astype(np.float64)))
                     if ref_std < zero_threshold:
                         rec[f"ground_truth_{key}"] = float("nan")
-                        rec[f"delta_{key}_percent"] = float("nan")
                         rec[f"stability_{key}"] = float("nan")
                         continue
                 if not base_finite or not cur_finite:
-                    rec[f"delta_{key}_percent"] = float("nan")
                     rec[f"stability_{key}"] = float("nan")
                 elif abs_base < zero_threshold:
                     if abs_cur < zero_threshold:
-                        rec[f"delta_{key}_percent"] = 0.0
                         rec[f"stability_{key}"] = 0.0
                     else:
-                        rec[f"delta_{key}_percent"] = float("nan")
                         rec[f"stability_{key}"] = float("nan")
                 else:
-                    rec[f"delta_{key}_percent"] = 100.0 * (cur_val - base_val) / abs_base
                     rec[f"stability_{key}"] = 100.0 * abs(cur_val - base_val) / abs_base
         return rec
 
@@ -2433,7 +2564,17 @@ class DataAnalysisTab(QWidget):
 
         mode = self.analysis_mode_combo.currentText()
         records = []
+        self._cached_lesion_exclusion_mask = None
+        self._cached_global_bg_mask = None
+        if scenarios:
+            shape = np.asarray(scenarios[0][1]).shape
+            if self._use_global_liver_noise_roi():
+                self._cached_lesion_exclusion_mask = self._all_lesion_exclusion_mask(
+                    shape, lesions, use_cache=False
+                )
+                self._cached_global_bg_mask = self._global_liver_noise_mask(shape, lesions)
         scenario_noise_cache = self._build_scenario_noise_cache(scenarios, lesions, mode)
+        lesion_run_cache = self._build_lesion_run_cache(shape, lesions, mode)
         if mode == "Noise-Bias Curve" and self._use_global_liver_noise_roi():
             low_vox = [
                 name
@@ -2475,6 +2616,8 @@ class DataAnalysisTab(QWidget):
                     raise ValueError("step")
             except Exception:
                 QMessageBox.warning(self, "Invalid Sweep", "Use numeric filter start/stop/step and a positive step.")
+                self._cached_lesion_exclusion_mask = None
+                self._cached_global_bg_mask = None
                 return
             if len(scenarios) > 1:
                 QMessageBox.information(
@@ -2495,6 +2638,8 @@ class DataAnalysisTab(QWidget):
                                 lesion,
                                 fwhm_mm=fwhm,
                                 lesions=lesions,
+                                analysis_mode=mode,
+                                lesion_run_cache=lesion_run_cache,
                             )
                         )
         else:
@@ -2509,6 +2654,8 @@ class DataAnalysisTab(QWidget):
                             fwhm_mm=0.0,
                             scenario_noise_cache=scenario_noise_cache,
                             lesions=lesions,
+                            analysis_mode=mode,
+                            lesion_run_cache=lesion_run_cache,
                         )
                     )
 
@@ -2564,6 +2711,8 @@ class DataAnalysisTab(QWidget):
         self.analysis_summary_label.setText(summary)
         # Ensure axis combos are valid for the active mode before drawing on current tab.
         self._update_mode_visibility()
+        self._cached_lesion_exclusion_mask = None
+        self._cached_global_bg_mask = None
         self.plot_current_results()
 
     def _populate_table(self, mode, records):
@@ -2682,11 +2831,12 @@ class DataAnalysisTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save figure",
-            "analysis_figure.png",
+            self._dialog_path("analysis_figure.png"),
             "PNG (*.png);;JPEG (*.jpg *.jpeg);;Bitmap (*.bmp)",
         )
         if not path:
             return
+        self._remember_dialog_path(path)
         try:
             ok = capture_widget.grab().save(path)
             if not ok:
