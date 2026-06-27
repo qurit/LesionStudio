@@ -1993,15 +1993,7 @@ class DICOMViewer(QMainWindow):
         if modality in {"PET", "SPECT"}:
             self.modality_combo.setCurrentText(modality)
 
-        paths = data.get("paths") or {}
-        self.pet_folder_path = paths.get("pet_folder_path")
-        self.ct_folder_path = paths.get("ct_folder_path")
-        self.projection_file_path = paths.get("projection_file_path")
-
-        self.pet_folder_status.setText(f"✅ {os.path.basename(self.pet_folder_path)}" if self.pet_folder_path else "No folder selected.")
-        self.pet_ct_status.setText(f"✅ {os.path.basename(self.ct_folder_path)}" if self.selected_modality == "PET" and self.ct_folder_path else "No folder selected.")
-        self.ct_status.setText(f"✅ {os.path.basename(self.ct_folder_path)}" if self.selected_modality == "SPECT" and self.ct_folder_path else "No folder selected.")
-        self.projection_status.setText(f"✅ {os.path.basename(self.projection_file_path)}" if self.projection_file_path else "No file/folder selected.")
+        path_warnings = self._restore_workflow_paths(data.get("paths") or {})
 
         self.quant_mode = str(data.get("quant_mode", "Arbitrary"))
         self.quantification_params = dict(data.get("quantification_params") or self.quantification_params)
@@ -2084,12 +2076,21 @@ class DICOMViewer(QMainWindow):
         self._update_lesion_ui_state()
         self.tabs.setCurrentIndex(2)
 
+        completed_volumes = self._completed_queue_result_count()
         parts = [
             f"Loaded workflow from:\n{path}",
             f"Restored lesions: {restored_lesions}" + (f" (skipped {skipped_lesions})" if skipped_lesions else ""),
             f"Restored queued reconstructions: {len(self.reconstruction_queue)}" + (f" (skipped {skipped_queue_items})" if skipped_queue_items else ""),
             f"Restored saved results: {len(self.queue_results)}" + (f" (skipped {skipped_results})" if skipped_results else ""),
         ]
+        if completed_volumes > 0:
+            parts.append(
+                f"Reconstruction volumes in memory: {completed_volumes}.\n"
+                "Open Tab 4 (Data Analysis) → select scenarios → Run Analysis.\n"
+                "Execute Queue on Tab 3 only if you want to re-run reconstructions from raw PET/SPECT data."
+            )
+        if path_warnings:
+            parts.append("Note on data paths:\n" + "\n\n".join(path_warnings))
         QMessageBox.information(self, "Workflow loaded", "\n\n".join(parts))
 
     def _prepare_quantitative_dicom(self, sitk_float_image):
@@ -2244,6 +2245,146 @@ class DICOMViewer(QMainWindow):
                 "Multi-bed PET needs a corrections .h5 for each bed (or clearly paired filenames)."
             )
         return True, ""
+
+    def _completed_queue_result_count(self):
+        return sum(
+            1
+            for r in getattr(self, "queue_results", [])
+            if str(getattr(r, "status", "")) == "Completed"
+            and getattr(r, "result", None) is not None
+        )
+
+    def _restore_workflow_paths(self, paths):
+        """
+        Restore Tab 2 data paths from a saved workflow.
+        Returns user-facing warnings for paths that are missing on this machine.
+        """
+        paths = paths or {}
+        warnings = []
+
+        pet = paths.get("pet_folder_path")
+        if pet:
+            if os.path.isdir(pet):
+                ok, err = self._validate_pet_data_folder(pet)
+                if ok:
+                    self.pet_folder_path = pet
+                    self.pet_folder_status.setText(f"✅ {os.path.basename(pet)}")
+                else:
+                    self.pet_folder_path = None
+                    self.pet_folder_status.setText("⚠ Re-select PET folder")
+                    warnings.append(f"PET folder is invalid:\n{pet}\n\n{err}")
+            else:
+                self.pet_folder_path = None
+                self.pet_folder_status.setText("⚠ Re-select PET folder")
+                warnings.append(
+                    f"PET data folder from the saved workflow was not found on this computer:\n{pet}\n\n"
+                    "This only matters if you re-run Initial Reconstruction or Execute Queue on Tab 3. "
+                    "Saved reconstruction volumes in the workflow are still available for Tab 4 analysis."
+                )
+        else:
+            self.pet_folder_path = None
+            self.pet_folder_status.setText("No folder selected.")
+
+        ct = paths.get("ct_folder_path")
+        if ct:
+            if os.path.isdir(ct):
+                self.ct_folder_path = ct
+                if self.selected_modality == "PET":
+                    self.pet_ct_status.setText(f"✅ {os.path.basename(ct)}")
+                else:
+                    self.ct_status.setText(f"✅ {os.path.basename(ct)}")
+            else:
+                self.ct_folder_path = None
+                self.pet_ct_status.setText("⚠ Re-select CT folder")
+                self.ct_status.setText("⚠ Re-select CT folder")
+                warnings.append(f"CT folder not found:\n{ct}")
+        else:
+            self.ct_folder_path = None
+
+        proj = paths.get("projection_file_path")
+        if proj:
+            if os.path.isdir(proj) or os.path.isfile(proj):
+                self.projection_file_path = proj
+                self.projection_status.setText(f"✅ {os.path.basename(proj)}")
+            else:
+                self.projection_file_path = None
+                self.projection_status.setText("⚠ Re-select projections")
+                warnings.append(f"SPECT projection path not found:\n{proj}")
+        else:
+            self.projection_file_path = None
+
+        return warnings
+
+    def _preflight_queue_execution(self):
+        """
+        Execute Queue re-runs lesion insertion reconstruction from raw data (PET listmode
+        or SPECT projections). It does not replay volumes already stored in queue_results.
+        """
+        if not self.lesion_objects:
+            QMessageBox.warning(self, "No Lesions", "Add or restore at least one lesion before running the queue.")
+            return False
+
+        saved_volumes = self._completed_queue_result_count()
+        if saved_volumes > 0:
+            answer = QMessageBox.question(
+                self,
+                "Re-run reconstruction queue?",
+                f"This workflow already contains {saved_volumes} completed reconstruction volume(s).\n\n"
+                "Execute Queue will run everything again from raw scanner data "
+                "(PET .blf/.h5 folder or SPECT projections), not from the saved images.\n\n"
+                "To analyze saved results without re-running, open Tab 4 (Data Analysis) "
+                "and click Run Analysis.\n\n"
+                "Continue and re-run the queue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+
+        if self.image_array is None:
+            QMessageBox.warning(
+                self,
+                "Initial reconstruction required",
+                "No initial reconstruction volume is loaded.\n\n"
+                "After loading a workflow, run Initial Reconstruction on Tab 2, "
+                "or ensure the workflow file includes a saved image_array.",
+            )
+            return False
+        if self.selected_modality == "PET":
+            if not self.pet_folder_path:
+                QMessageBox.warning(
+                    self,
+                    "PET data folder required to re-run queue",
+                    "Execute Queue rebuilds reconstructions from raw PET listmode (.blf + .h5).\n\n"
+                    "Saved volumes from the workflow cannot be used for a new queue run. "
+                    "Either re-select the PET folder on Tab 2, or use Tab 4 to analyze "
+                    "results that were already saved in the workflow.",
+                )
+                return False
+            ok, err = self._validate_pet_data_folder(self.pet_folder_path)
+            if not ok:
+                QMessageBox.warning(
+                    self,
+                    "PET data folder invalid",
+                    f"The PET data folder cannot be used:\n{self.pet_folder_path}\n\n{err}",
+                )
+                return False
+        elif self.selected_modality == "SPECT":
+            if not self.projection_file_path:
+                QMessageBox.warning(
+                    self,
+                    "SPECT projections required",
+                    "No projection file or folder is set.\n\nRe-select SPECT data on Tab 2.",
+                )
+                return False
+            if not os.path.isdir(self.projection_file_path) and not os.path.isfile(self.projection_file_path):
+                QMessageBox.warning(
+                    self,
+                    "SPECT projections not found",
+                    f"Projection path does not exist:\n{self.projection_file_path}",
+                )
+                return False
+        return True
 
     def _modality_changed(self, modality):
         self.selected_modality = None if modality == "-- Select a Modality --" else modality
@@ -2818,7 +2959,10 @@ class DICOMViewer(QMainWindow):
             self.status_bar.showMessage("Reconstruction queue cleared.")
 
     def execute_reconstruction_queue(self):
-        if not self.reconstruction_queue: return
+        if not self.reconstruction_queue:
+            return
+        if not self._preflight_queue_execution():
+            return
         self.current_queue_index = 0
         self.queue_results = []
         self.results_list.clear()

@@ -436,18 +436,38 @@ class LesionFinalizationThread(QThread):
                 is_multibed = False
                 list_files = []
                 h5_files = []
-                if os.path.isdir(self.listmode_file):
-                    all_files = sorted(os.listdir(self.listmode_file), key=natural_keys)
-                    list_files = [os.path.join(self.listmode_file, f) for f in all_files if f.lower().endswith('.blf')]
-                    h5_files = [os.path.join(self.corrections_file, f) for f in all_files if f.lower().endswith('.h5')]
-                    if len(list_files) > 1: is_multibed = True
+                listmode_root = self.listmode_file
+                corrections_root = self.corrections_file
+                if os.path.isdir(listmode_root):
+                    all_files = sorted(os.listdir(listmode_root), key=natural_keys)
+                    list_files = [os.path.join(listmode_root, f) for f in all_files if f.lower().endswith('.blf')]
+                    corr_dir = corrections_root if os.path.isdir(corrections_root) else listmode_root
+                    h5_files = [os.path.join(corr_dir, f) for f in os.listdir(corr_dir) if f.lower().endswith('.h5')]
+                    if len(list_files) > 1:
+                        is_multibed = True
                     else:
-                        if list_files: list_files = [list_files[0]]
-                        if h5_files: h5_files = [h5_files[0]]
+                        if list_files:
+                            list_files = [list_files[0]]
+                        if h5_files:
+                            h5_files = [h5_files[0]]
+                elif os.path.isfile(listmode_root):
+                    list_files = [listmode_root]
+                    h5_files = [corrections_root]
                 else:
-                    list_files = [self.listmode_file]
-                    h5_files = [self.corrections_file]
-                if not list_files: raise FileNotFoundError("No .BLF files found.")
+                    raise FileNotFoundError(
+                        f"PET listmode path not found:\n{listmode_root}\n\n"
+                        "The saved workflow points to a folder on another computer or drive. "
+                        "On Tab 2, click Load PET Folder and select the folder with your .blf and .h5 files."
+                    )
+                if not list_files:
+                    raise FileNotFoundError(
+                        f"No .blf listmode files found in:\n{listmode_root}"
+                    )
+                if not h5_files:
+                    raise FileNotFoundError(
+                        f"No .h5 corrections files found for PET reconstruction "
+                        f"(checked alongside {listmode_root})."
+                    )
                 num_beds = len(list_files)
 
                 try:
