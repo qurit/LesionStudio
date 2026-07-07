@@ -1,6 +1,6 @@
-# Lesion Insertion Toolbox
+# LesionStudio
 
-Repository: [github.com/qurit/lesion-insertion-toolbox](https://github.com/qurit/lesion-insertion-toolbox)
+Repository: [github.com/qurit/LesionStudio](https://github.com/qurit/LesionStudio)
 
 GUI application for inserting synthetic lesions into PET and SPECT data, re-reconstructing the modified data, and analysing quantitative image-quality metrics. Built on [PyTomography](https://github.com/qurit/PyTomography).
 
