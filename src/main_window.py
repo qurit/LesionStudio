@@ -2357,7 +2357,7 @@ class DICOMViewer(QMainWindow):
                     "PET data folder required to re-run queue",
                     "Execute Queue rebuilds reconstructions from raw PET listmode (.blf + .h5).\n\n"
                     "Saved volumes from the workflow cannot be used for a new queue run. "
-                    "Either re-select the PET folder on Tab 2, or use Tab 4 to analyze "
+                    "Either re-select the PET folder on Tab 1, or use Tab 4 to analyze "
                     "results that were already saved in the workflow.",
                 )
                 return False
