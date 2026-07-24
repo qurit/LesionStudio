@@ -48,6 +48,7 @@ try:
         lesion_volume_spacing_mm,
         parse_iteration_from_scenario_name,
         reference_lesion_voxels_on_grid,
+        scenario_base_name,
     )
     from src.models import Lesion
     from src.dialogs import NoiseRoiPickerDialog
@@ -68,6 +69,7 @@ except ModuleNotFoundError:
         lesion_volume_spacing_mm,
         parse_iteration_from_scenario_name,
         reference_lesion_voxels_on_grid,
+        scenario_base_name,
     )
     from src.models import Lesion
     from src.dialogs import NoiseRoiPickerDialog
@@ -1003,7 +1005,7 @@ class DataAnalysisTab(QWidget):
         legend_list.setMaximumWidth(320)
         legend_list.setIconSize(QSize(22, 18))
         legend_list.setToolTip(
-            "Algorithms: colored squares. Lesions: marker shape. Double-click a row to rename."
+            "Reconstructions: colored squares. Lesions: marker shape. Double-click a row to rename."
         )
         legend_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
         legend_list.setStyleSheet(
@@ -1559,7 +1561,10 @@ class DataAnalysisTab(QWidget):
         self._current_records = []
         for r in raw_recs:
             if isinstance(r, dict):
-                self._current_records.append(dict(r))
+                d = dict(r)
+                if not str(d.get("recon_series") or "").strip():
+                    d["recon_series"] = scenario_base_name(d.get("scenario", "Unknown"))
+                self._current_records.append(d)
         self._records_mode = mode
         self._records_signature = self._current_analysis_signature()
 
@@ -2409,6 +2414,8 @@ class DataAnalysisTab(QWidget):
             "scenario": scenario_name,
             "modality": scenario_meta.get("modality", "Unknown"),
             "recon_algo": scenario_meta.get("algo", "Unknown"),
+            # Queue item identity (strips _iterN). Keeps multiple BSREM/OSEM runs separate.
+            "recon_series": scenario_base_name(scenario_name),
             "iter_number": scenario_meta.get("iter_number", -1),
             "lesion_idx": lesion_idx + 1,
             "lesion_name": getattr(lesion, "name", f"Lesion_{lesion_idx+1}"),
@@ -2723,10 +2730,11 @@ class DataAnalysisTab(QWidget):
             self.results_table.setSortingEnabled(True)
             return
 
-        # Deterministic ordering for easier QC: algorithm -> iteration -> lesion -> scenario
+        # Deterministic ordering for easier QC: recon series -> iteration -> lesion -> scenario
         records = sorted(
             records,
             key=lambda r: (
+                str(r.get("recon_series") or scenario_base_name(r.get("scenario", ""))),
                 str(r.get("recon_algo", "")),
                 int(r.get("iter_number", 0)),
                 str(r.get("lesion_name", "")),
@@ -2846,7 +2854,7 @@ class DataAnalysisTab(QWidget):
             QMessageBox.critical(self, "Save Error", f"Could not save figure:\n{e}")
 
     def _legend_marker_icon(self, color_rgb, symbol_key, w=26, h=20):
-        """Icon matching pyqtgraph scatter markers: color = algorithm, shape = lesion."""
+        """Icon matching pyqtgraph scatter markers: color = recon series, shape = lesion."""
         pm = QPixmap(w, h)
         pm.fill(Qt.transparent)
         painter = QPainter(pm)
@@ -2944,7 +2952,48 @@ class DataAnalysisTab(QWidget):
         painter.end()
         return QIcon(pm)
 
+    # Distinct colors assigned per queued reconstruction series (not per algorithm name),
+    # so multiple BSREM (or OSEM) queue items stay visually separate.
+    _SERIES_COLOR_PALETTE = [
+        (60, 170, 255),
+        (255, 70, 170),
+        (80, 210, 130),
+        (220, 120, 255),
+        (255, 180, 50),
+        (50, 200, 200),
+        (255, 100, 80),
+        (180, 180, 60),
+        (140, 160, 255),
+        (255, 140, 200),
+    ]
+
+    def _recon_series_id(self, rec):
+        series = str(rec.get("recon_series") or "").strip()
+        if series:
+            return series
+        return scenario_base_name(rec.get("scenario", "Unknown"))
+
+    def _ordered_recon_series(self, records):
+        ordered = []
+        seen = set()
+        for rec in records or []:
+            s = self._recon_series_id(rec)
+            if s not in seen:
+                seen.add(s)
+                ordered.append(s)
+        return ordered
+
+    def _recon_series_color_map(self, records=None):
+        """Map each queued recon series to a distinct color (appearance order)."""
+        records = records if records is not None else (self._current_records or [])
+        palette = self._SERIES_COLOR_PALETTE
+        return {
+            s: palette[i % len(palette)]
+            for i, s in enumerate(self._ordered_recon_series(records))
+        }
+
     def _algo_color_map(self):
+        # Kept for backward compatibility; plots use _recon_series_color_map instead.
         return {
             "OSEM": (60, 170, 255),
             "BSREM": (255, 70, 170),
@@ -3007,6 +3056,7 @@ class DataAnalysisTab(QWidget):
     def _series_plot_tooltip(self, rec):
         return (
             f"Scenario: {rec.get('scenario', '')}\n"
+            f"Reconstruction: {self._recon_series_id(rec)}\n"
             f"Algorithm: {rec.get('recon_algo', '')}\n"
             f"Iteration: {rec.get('iter_number', '')}\n"
             f"Lesion: {rec.get('lesion_name', '')}"
@@ -3024,6 +3074,8 @@ class DataAnalysisTab(QWidget):
 
     def _compact_legend_default_label(self, key):
         s = str(key)
+        if s.startswith("__recon__"):
+            return s[len("__recon__") :]
         if s.startswith("__algo__"):
             return s[len("__algo__") :]
         if s.startswith("__lesion__"):
@@ -3033,7 +3085,7 @@ class DataAnalysisTab(QWidget):
         return s
 
     def _build_compact_legend(self, legend_list, include_reference=False, x_axis_metric=None):
-        """One row per algorithm (colored square) and one row per lesion (name + shape)."""
+        """One row per reconstruction series (colored square) and one row per lesion (name + shape)."""
         if legend_list is None or not self.show_legend_checkbox.isChecked():
             return
         records = self._current_records or []
@@ -3041,28 +3093,21 @@ class DataAnalysisTab(QWidget):
         def display_name(k):
             return self._legend_aliases.get(str(k), self._compact_legend_default_label(k))
 
-        algo_color = self._algo_color_map()
-        algos = set()
+        series_color = self._recon_series_color_map(records)
+        series_list = self._ordered_recon_series(records)
         lesions = set()
         for rec in records:
-            a = str(rec.get("recon_algo", "Unknown")).strip() or "Unknown"
-            algos.add(a.upper())
             ln = rec.get("lesion_name")
             if ln is not None and str(ln).strip():
                 lesions.add(str(ln).strip())
 
-        def algo_sort_key(a):
-            order = {"OSEM": 0, "BSREM": 1, "OSMAPOSL": 2, "KEM": 3}
-            return (order.get(a.upper(), 99), a)
-
-        sorted_algos = sorted(algos, key=algo_sort_key)
         sorted_lesions = sorted(lesions)
         neutral = (216, 222, 233)
 
         self._legend_refresh_in_progress = True
-        for algo in sorted_algos:
-            k = f"__algo__{algo}"
-            color = algo_color.get(algo.upper(), (200, 200, 200))
+        for series in series_list:
+            k = f"__recon__{series}"
+            color = series_color.get(series, (200, 200, 200))
             item = QListWidgetItem(display_name(k))
             item.setData(Qt.UserRole, k)
             item.setIcon(self._legend_marker_icon(color, "s"))
@@ -3077,9 +3122,10 @@ class DataAnalysisTab(QWidget):
             item.setForeground(QColor(216, 222, 233))
             legend_list.addItem(item)
         legend_list.setToolTip(
-            "Algorithms: colored squares. Lesions: marker shape. "
+            "Reconstructions: colored squares (one color per queued recon). "
+            "Lesions: marker shape. "
             "Hover any curve or markers for scenario, algorithm, iteration, and lesion. "
-            "Double-click a row to rename (algorithms and lesions only)."
+            "Double-click a row to rename (reconstructions and lesions only)."
         )
         if include_reference:
             k = "__ref__phantom"
@@ -3170,10 +3216,10 @@ class DataAnalysisTab(QWidget):
         self._recenter_y_axis_label(plot)
 
     def _trajectory_group_key(self, rec):
-        """One curve per reconstruction algorithm and lesion (iterations are points along the curve)."""
-        algo = str(rec.get("recon_algo", "Unknown")).strip() or "Unknown"
+        """One curve per queued reconstruction and lesion (iterations are points along the curve)."""
+        series = self._recon_series_id(rec)
         lesion = str(rec.get("lesion_name", "")).strip() or f"Lesion_{rec.get('lesion_idx', 0)}"
-        return f"{algo} | {lesion}"
+        return f"{series} | {lesion}"
 
     def _group_records_for_trajectory(self, records):
         grouped = {}
@@ -3293,9 +3339,9 @@ class DataAnalysisTab(QWidget):
             target_plot.addLegend(offset=(10, 10))
 
         def style_for_record(rec):
-            algo = str(rec.get("recon_algo", "")).upper()
-            algo_color_map = self._algo_color_map()
-            color = algo_color_map.get(algo, (200, 200, 200))
+            series_color_map = self._recon_series_color_map()
+            series = self._recon_series_id(rec)
+            color = series_color_map.get(series, (200, 200, 200))
             line_style = Qt.SolidLine
             symbol, sym_sz = self._lesion_symbol_and_size(rec)
             return color, symbol, line_style, sym_sz
@@ -3415,7 +3461,7 @@ class DataAnalysisTab(QWidget):
             target_plot.setLabel("bottom", self._metric_labels.get(x_key, x_key))
             grouped = {}
             for rec in self._current_records:
-                key = f"{rec['scenario']} | {rec['lesion_name']} | {rec['recon_algo']}"
+                key = f"{self._recon_series_id(rec)} | {rec['lesion_name']} | {rec['scenario']}"
                 grouped.setdefault(key, []).append(rec)
             for idx, (name, rows) in enumerate(grouped.items()):
                 rows = sorted(rows, key=lambda r: r["filter_fwhm_mm"])

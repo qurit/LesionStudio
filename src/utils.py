@@ -367,6 +367,27 @@ def parse_iteration_from_scenario_name(scenario_name):
         return None
 
 
+def scenario_base_name(scenario_name):
+    """
+    Queue/recon identity for analysis plots: strip trailing _iterN.
+    e.g. BSREM_low_iter3 -> BSREM_low; two different BSREM queue names stay distinct.
+    """
+    name = str(scenario_name or "").strip()
+    if not name:
+        return "Unknown"
+    low = name.lower()
+    idx = low.rfind("_iter")
+    if idx < 0:
+        return name
+    suffix = low[idx + len("_iter") :]
+    if not suffix:
+        return name
+    head = suffix.split("_", 1)[0]
+    if head.isdigit():
+        return name[:idx]
+    return name
+
+
 def iter_number_for_recon_result(result_name, n_iters=None, save_all_iterations=False):
     """
     Iteration label for Tab 4 analysis.
